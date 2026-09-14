@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "dylanbr.agent-usage-cursor",
+  "name": "Agent Usage: Cursor",
+  "version": "0.1.0",
+  "author": "Dylan Bridgman",
+  "license": "MIT",
+  "description": "Adds Cursor subscription usage and limits to Omarchy's built-in Agents panel.",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}

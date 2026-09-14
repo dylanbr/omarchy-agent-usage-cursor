@@ -1,0 +1,453 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Cursor usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect Cursor subscription usage into one display-ready JSON record.
+
+Limits come from cursor.com's usage-summary endpoint (the same numbers the
+dashboard shows): Cursor Models and API Models percent-used for the billing
+cycle, plus on-demand when that meter is capped. Plan tier comes from
+api2.cursor.sh/auth/full_stripe_profile. Day/model token stats are built from
+dashboard usage events when available.
+
+Auth is the access token written by `cursor-agent` / Cursor CLI login into
+~/.config/cursor/auth.json (or CURSOR_ACCESS_TOKEN / CURSOR_API_KEY). The
+agents panel only ever reads the JSON this prints.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+AGENT_ID = "cursor"
+AGENT_NAME = "Cursor"
+AUTH_HELP = "Run `cursor-agent` and sign in, or set CURSOR_ACCESS_TOKEN."
+API2 = os.environ.get("CURSOR_API_ENDPOINT", "https://api2.cursor.sh").rstrip("/")
+DASHBOARD = "https://cursor.com"
+EVENTS_MAX_PAGES = 15
+EVENTS_PAGE_SIZE = 100
+EVENTS_LOOKBACK_DAYS = 30
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+  def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: N802
+    return None
+
+
+class CursorError(Exception):
+  pass
+
+
+def empty_stats() -> dict[str, Any]:
+  return {
+    "todayPrompts": 0,
+    "todaySessions": 0,
+    "todayTotalTokens": 0,
+    "todayTokensByModel": {},
+    "recentDays": [],
+    "totalPrompts": 0,
+    "totalSessions": 0,
+    "activeDays": 0,
+    "activeDates": [],
+    "modelUsage": {},
+  }
+
+
+def base_record(**overrides: Any) -> dict[str, Any]:
+  record: dict[str, Any] = {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "updatedAt": datetime.now(timezone.utc).isoformat(),
+    "ready": False,
+    "hasLocalStats": False,
+    # Account-global meters: synced machines must not sum them.
+    "scope": "account",
+    "hasPromptStats": False,
+    "tierLabel": "",
+    "usageStatusText": "",
+    "authHelpText": "",
+    "limits": [],
+  }
+  record.update(empty_stats())
+  record.update(overrides)
+  return record
+
+
+def access_token() -> str:
+  for key in ("CURSOR_ACCESS_TOKEN", "CURSOR_API_KEY"):
+    value = os.environ.get(key, "").strip()
+    if value:
+      return value
+  config = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "cursor" / "auth.json"
+  try:
+    parsed = json.loads(config.read_text())
+  except (OSError, json.JSONDecodeError):
+    return ""
+  if not isinstance(parsed, dict):
+    return ""
+  return str(parsed.get("accessToken") or "").strip()
+
+
+def jwt_claims(token: str) -> dict[str, Any]:
+  try:
+    part = token.split(".")[1]
+    part += "=" * (-len(part) % 4)
+    claims = json.loads(base64.urlsafe_b64decode(part))
+  except (IndexError, ValueError, json.JSONDecodeError, OSError):
+    return {}
+  return claims if isinstance(claims, dict) else {}
+
+
+def session_user_id(token: str) -> str:
+  sub = str(jwt_claims(token).get("sub") or "").strip()
+  if not sub:
+    raise CursorError("Cursor access token is missing a subject claim")
+  return sub
+
+
+def session_cookie(token: str) -> str:
+  # Dashboard endpoints expect WorkosCursorSessionToken=<userId>::<accessToken>
+  # (URL-encoded). The CLI JWT's `sub` works; auth/me uses the same id without
+  # an auth0| prefix on some accounts, so try the JWT subject as-is.
+  return "WorkosCursorSessionToken=" + urllib.parse.quote(
+    session_user_id(token) + "::" + token, safe=""
+  )
+
+
+def request_json(
+  url: str,
+  *,
+  headers: dict[str, str],
+  data: bytes | None = None,
+  method: str | None = None,
+) -> Any:
+  req = urllib.request.Request(url, data=data, headers=headers, method=method)
+  try:
+    with urllib.request.build_opener(NoRedirectHandler()).open(req, timeout=20) as response:
+      return json.load(response)
+  except urllib.error.HTTPError as error:
+    body = error.read()[:200]
+    if error.code in (401, 403):
+      raise CursorError("Cursor rejected the access token") from error
+    raise CursorError(f"Cursor API returned HTTP {error.code}: {body!r}") from error
+  except urllib.error.URLError as error:
+    raise CursorError("Could not reach the Cursor API") from error
+  except (json.JSONDecodeError, TimeoutError) as error:
+    raise CursorError("Cursor returned an invalid JSON response") from error
+
+
+def fetch_stripe(token: str) -> dict[str, Any]:
+  return request_json(
+    API2 + "/auth/full_stripe_profile",
+    headers={
+      "Accept": "application/json",
+      "Authorization": "Bearer " + token,
+      "User-Agent": "omarchy-agent-usage-cursor/0.1",
+    },
+  )
+
+
+def fetch_usage_summary(token: str) -> dict[str, Any]:
+  return request_json(
+    DASHBOARD + "/api/usage-summary",
+    headers={
+      "Accept": "application/json",
+      "Cookie": session_cookie(token),
+      "User-Agent": "omarchy-agent-usage-cursor/0.1",
+    },
+  )
+
+
+def fetch_usage_events(token: str, start: datetime, end: datetime) -> list[dict[str, Any]]:
+  headers = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "Cookie": session_cookie(token),
+    "Origin": DASHBOARD,
+    "User-Agent": "omarchy-agent-usage-cursor/0.1",
+  }
+  events: list[dict[str, Any]] = []
+  total = None
+  for page in range(1, EVENTS_MAX_PAGES + 1):
+    body = json.dumps(
+      {
+        "startDate": str(int(start.timestamp() * 1000)),
+        "endDate": str(int(end.timestamp() * 1000)),
+        "page": page,
+        "pageSize": EVENTS_PAGE_SIZE,
+      }
+    ).encode()
+    payload = request_json(
+      DASHBOARD + "/api/dashboard/get-filtered-usage-events",
+      headers=headers,
+      data=body,
+      method="POST",
+    )
+    if not isinstance(payload, dict):
+      break
+    if total is None:
+      try:
+        total = int(payload.get("totalUsageEventsCount") or 0)
+      except (TypeError, ValueError):
+        total = 0
+    batch = payload.get("usageEventsDisplay")
+    if not isinstance(batch, list) or not batch:
+      break
+    for entry in batch:
+      if isinstance(entry, dict):
+        events.append(entry)
+    if len(events) >= total or len(batch) < EVENTS_PAGE_SIZE:
+      break
+  return events
+
+
+def number(value: Any) -> float | None:
+  try:
+    if value is None:
+      return None
+    return float(value)
+  except (TypeError, ValueError):
+    return None
+
+
+def clamp_percent(value: float) -> float:
+  return min(1.0, max(0.0, value / 100.0 if value > 1.0 else value))
+
+
+def iso_or_empty(value: Any) -> str:
+  text = str(value or "").strip()
+  if not text:
+    return ""
+  try:
+    if text.endswith("Z"):
+      dt = datetime.fromisoformat(text[:-1] + "+00:00")
+    else:
+      dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+      dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+  except ValueError:
+    return text
+
+
+def tier_label(stripe: dict[str, Any], summary: dict[str, Any]) -> str:
+  membership = str(
+    summary.get("membershipType")
+    or stripe.get("individualMembershipType")
+    or stripe.get("membershipType")
+    or ""
+  ).strip()
+  if not membership:
+    return ""
+  return membership.replace("_", " ").title()
+
+
+def to_limits(summary: dict[str, Any]) -> list[dict[str, Any]]:
+  resets_at = iso_or_empty(summary.get("billingCycleEnd"))
+  limits: list[dict[str, Any]] = []
+  individual = summary.get("individualUsage")
+  if not isinstance(individual, dict):
+    return limits
+
+  plan = individual.get("plan")
+  if isinstance(plan, dict) and plan.get("enabled") is not False:
+    auto = number(plan.get("autoPercentUsed"))
+    api = number(plan.get("apiPercentUsed"))
+    total = number(plan.get("totalPercentUsed"))
+    if auto is not None:
+      limits.append({"label": "Cursor Models", "percent": clamp_percent(auto), "resetsAt": resets_at})
+    if api is not None:
+      limits.append({"label": "API Models", "percent": clamp_percent(api), "resetsAt": resets_at})
+    if not limits and total is not None:
+      limits.append({"label": "Plan", "percent": clamp_percent(total), "resetsAt": resets_at})
+    # Older enterprise shape: overall cents bucket.
+    if not limits:
+      overall = individual.get("overall")
+      if isinstance(overall, dict) and overall.get("enabled") is not False:
+        used = number(overall.get("used"))
+        limit = number(overall.get("limit"))
+        if used is not None and limit is not None and limit > 0:
+          limits.append(
+            {
+              "label": "Personal Usage",
+              "percent": clamp_percent(used / limit),
+              "resetsAt": resets_at,
+            }
+          )
+
+  on_demand = individual.get("onDemand")
+  if isinstance(on_demand, dict) and on_demand.get("enabled") is True:
+    used = number(on_demand.get("used"))
+    limit = number(on_demand.get("limit"))
+    if used is not None and limit is not None and limit > 0:
+      limits.append(
+        {
+          "label": "On-Demand",
+          "percent": clamp_percent(used / limit),
+          "resetsAt": resets_at,
+        }
+      )
+  return limits
+
+
+def event_timestamp(entry: dict[str, Any]) -> datetime | None:
+  raw = entry.get("timestamp")
+  try:
+    millis = float(raw)
+  except (TypeError, ValueError):
+    return None
+  if millis > 10_000_000_000_000:  # already µs? unlikely
+    millis /= 1000
+  if millis < 10_000_000_000:  # seconds
+    millis *= 1000
+  try:
+    return datetime.fromtimestamp(millis / 1000.0, tz=timezone.utc).astimezone()
+  except (OverflowError, OSError, ValueError):
+    return None
+
+
+def event_tokens(entry: dict[str, Any]) -> tuple[int, int, int, int]:
+  usage = entry.get("tokenUsage")
+  if not isinstance(usage, dict):
+    return 0, 0, 0, 0
+
+  def as_int(key: str, *alts: str) -> int:
+    for name in (key, *alts):
+      value = number(usage.get(name))
+      if value is not None:
+        return max(0, int(value))
+    return 0
+
+  input_tokens = as_int("inputTokens", "input")
+  output_tokens = as_int("outputTokens", "output")
+  cache_read = as_int("cacheReadTokens", "cacheRead", "cache_read")
+  cache_write = as_int("cacheWriteTokens", "cacheWrite", "cache_write")
+  return input_tokens, output_tokens, cache_read, cache_write
+
+
+def aggregate_events(events: list[dict[str, Any]]) -> dict[str, Any]:
+  now = datetime.now().astimezone()
+  today = now.strftime("%Y-%m-%d")
+  recent_dates = [(now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+  recent = {day: {"date": day, "messageCount": 0} for day in recent_dates}
+  today_tokens_by_model: dict[str, int] = {}
+  model_usage: dict[str, dict[str, int]] = {}
+  today_sessions: set[str] = set()
+  all_sessions: set[str] = set()
+  active_dates: set[str] = set()
+  today_prompts = 0
+  total_prompts = 0
+
+  for entry in events:
+    ts = event_timestamp(entry)
+    if ts is None:
+      continue
+    day = ts.strftime("%Y-%m-%d")
+    model = str(entry.get("model") or "cursor").strip() or "cursor"
+    conversation = str(entry.get("conversationId") or "").strip()
+    input_tokens, output_tokens, cache_read, cache_write = event_tokens(entry)
+    total = input_tokens + output_tokens + cache_read + cache_write
+
+    total_prompts += 1
+    active_dates.add(day)
+    if conversation:
+      all_sessions.add(conversation)
+    if day in recent:
+      recent[day]["messageCount"] += total
+    bucket = model_usage.setdefault(
+      model,
+      {
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+      },
+    )
+    bucket["inputTokens"] += input_tokens
+    bucket["outputTokens"] += output_tokens
+    bucket["cacheReadInputTokens"] += cache_read
+    bucket["cacheCreationInputTokens"] += cache_write
+
+    if day == today:
+      today_prompts += 1
+      today_tokens_by_model[model] = today_tokens_by_model.get(model, 0) + total
+      if conversation:
+        today_sessions.add(conversation)
+
+  return {
+    "todayPrompts": today_prompts,
+    "todaySessions": len(today_sessions),
+    "todayTotalTokens": sum(today_tokens_by_model.values()),
+    "todayTokensByModel": today_tokens_by_model,
+    "recentDays": [recent[day] for day in recent_dates],
+    "totalPrompts": total_prompts,
+    "totalSessions": len(all_sessions),
+    "activeDays": len(active_dates),
+    "activeDates": sorted(active_dates),
+    "modelUsage": model_usage,
+    "hasLocalStats": total_prompts > 0,
+    "hasPromptStats": total_prompts > 0,
+  }
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser(description="Print the Cursor usage record as JSON")
+  parser.add_argument("--force", action="store_true")
+  parser.add_argument("--limits-only", action="store_true")
+  args = parser.parse_args()
+
+  try:
+    token = access_token()
+    if not token:
+      record = base_record(usageStatusText="Cursor unavailable", authHelpText=AUTH_HELP)
+    else:
+      stripe = fetch_stripe(token)
+      if not isinstance(stripe, dict):
+        stripe = {}
+      summary = fetch_usage_summary(token)
+      if not isinstance(summary, dict):
+        raise CursorError("Cursor returned an empty usage summary")
+
+      stats = empty_stats()
+      if not args.limits_only:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=EVENTS_LOOKBACK_DAYS)
+        try:
+          events = fetch_usage_events(token, start, end)
+          stats = aggregate_events(events)
+        except CursorError:
+          # Limits still matter if the events endpoint flakes.
+          stats = empty_stats()
+
+      record = base_record(
+        ready=True,
+        hasLocalStats=bool(stats.get("hasLocalStats")),
+        hasPromptStats=bool(stats.get("hasPromptStats")),
+        tierLabel=tier_label(stripe, summary),
+        limits=to_limits(summary),
+        **{k: stats[k] for k in empty_stats()},
+      )
+      if not record["limits"] and summary.get("isUnlimited"):
+        record["usageStatusText"] = "Unlimited plan"
+  except CursorError as error:
+    record = base_record(usageStatusText="Cursor unavailable", authHelpText=str(error))
+  except Exception:
+    record = base_record(usageStatusText="Cursor unavailable", authHelpText="Cursor usage scan failed")
+
+  print(json.dumps(record, separators=(",", ":")))
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())
