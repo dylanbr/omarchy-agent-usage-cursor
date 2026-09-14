@@ -19,7 +19,20 @@ Item {
 
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string usageDir: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/omarchy/agents/usage"
-  readonly property string pluginDir: Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "").replace(/\/$/, "")
+  // Resolve the plugin directory from a file:// URL, including percent-encoded paths.
+  readonly property string pluginDir: {
+    var path = Qt.resolvedUrl("./").toString()
+    if (path.indexOf("file://") === 0)
+      path = path.slice(7)
+    try {
+      path = decodeURIComponent(path)
+    } catch (e) {
+      // Keep the raw path if decoding fails.
+    }
+    if (path.length > 1 && path.charAt(path.length - 1) === "/")
+      path = path.slice(0, -1)
+    return path
+  }
   readonly property string recordPath: usageDir + "/cursor.json"
   readonly property string collector: pluginDir + "/collectors/omarchy-agent-usage-cursor"
 

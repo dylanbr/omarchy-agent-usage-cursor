@@ -41,7 +41,7 @@ DASHBOARD = "https://cursor.com"
 # Credential-bearing requests may only target these hosts (exact match).
 API_HOSTS = frozenset({"api2.cursor.sh"})
 DASHBOARD_HOSTS = frozenset({"cursor.com", "www.cursor.com"})
-EVENTS_MAX_PAGES = 15
+EVENTS_MAX_PAGES = 50
 EVENTS_PAGE_SIZE = 100
 EVENTS_LOOKBACK_DAYS = 30
 # Per-response cap: far above a normal page/summary, low enough to bound damage.
@@ -244,7 +244,7 @@ def fetch_usage_summary(token: str) -> dict[str, Any]:
   )
 
 
-def fetch_usage_events(token: str, start: datetime, end: datetime) -> list[dict[str, Any]]:
+def fetch_usage_events(token: str, start: datetime, end: datetime) -> tuple[list[dict[str, Any]], bool]:
   headers = {
     "Accept": "application/json",
     "Content-Type": "application/json",
@@ -254,6 +254,7 @@ def fetch_usage_events(token: str, start: datetime, end: datetime) -> list[dict[
   }
   events: list[dict[str, Any]] = []
   total = None
+  truncated = False
   for page in range(1, EVENTS_MAX_PAGES + 1):
     body = json.dumps(
       {
@@ -285,7 +286,11 @@ def fetch_usage_events(token: str, start: datetime, end: datetime) -> list[dict[
         events.append(entry)
     if len(events) >= total or len(batch) < EVENTS_PAGE_SIZE:
       break
-  return events
+    if page == EVENTS_MAX_PAGES:
+      truncated = True
+  if total is not None and len(events) < total:
+    truncated = True
+  return events, truncated
 
 
 def number(value: Any) -> float | None:
@@ -297,8 +302,14 @@ def number(value: Any) -> float | None:
     return None
 
 
-def clamp_percent(value: float) -> float:
-  return min(1.0, max(0.0, value / 100.0 if value > 1.0 else value))
+def percent_points(value: float) -> float:
+  """Map API percent-point fields (e.g. 78.5) onto a 0..1 meter fraction."""
+  return min(1.0, max(0.0, value / 100.0))
+
+
+def unit_fraction(value: float) -> float:
+  """Clamp an already-normalized used/limit ratio."""
+  return min(1.0, max(0.0, value))
 
 
 def iso_or_empty(value: Any) -> str:
@@ -342,11 +353,11 @@ def to_limits(summary: dict[str, Any]) -> list[dict[str, Any]]:
     api = number(plan.get("apiPercentUsed"))
     total = number(plan.get("totalPercentUsed"))
     if auto is not None:
-      limits.append({"label": "Cursor Models", "percent": clamp_percent(auto), "resetsAt": resets_at})
+      limits.append({"label": "Cursor Models", "percent": percent_points(auto), "resetsAt": resets_at})
     if api is not None:
-      limits.append({"label": "API Models", "percent": clamp_percent(api), "resetsAt": resets_at})
+      limits.append({"label": "API Models", "percent": percent_points(api), "resetsAt": resets_at})
     if not limits and total is not None:
-      limits.append({"label": "Plan", "percent": clamp_percent(total), "resetsAt": resets_at})
+      limits.append({"label": "Plan", "percent": percent_points(total), "resetsAt": resets_at})
     # Older enterprise shape: overall cents bucket.
     if not limits:
       overall = individual.get("overall")
@@ -357,7 +368,7 @@ def to_limits(summary: dict[str, Any]) -> list[dict[str, Any]]:
           limits.append(
             {
               "label": "Personal Usage",
-              "percent": clamp_percent(used / limit),
+              "percent": unit_fraction(used / limit),
               "resetsAt": resets_at,
             }
           )
@@ -370,7 +381,7 @@ def to_limits(summary: dict[str, Any]) -> list[dict[str, Any]]:
       limits.append(
         {
           "label": "On-Demand",
-          "percent": clamp_percent(used / limit),
+          "percent": unit_fraction(used / limit),
           "resetsAt": resets_at,
         }
       )
@@ -498,13 +509,18 @@ def main() -> int:
     if not token:
       record = base_record(usageStatusText="Cursor unavailable", authHelpText=AUTH_HELP)
     else:
-      stripe = fetch_stripe(token)
-      if not isinstance(stripe, dict):
+      try:
+        stripe = fetch_stripe(token)
+        if not isinstance(stripe, dict):
+          stripe = {}
+      except CursorError:
+        # Plan tier is nice-to-have; limits come from usage-summary.
         stripe = {}
       summary = fetch_usage_summary(token)
       if not isinstance(summary, dict):
         raise CursorError("Cursor returned an empty usage summary")
 
+      events_truncated = False
       if limits_only:
         stats = load_previous_stats()
       else:
@@ -512,7 +528,7 @@ def main() -> int:
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=EVENTS_LOOKBACK_DAYS)
         try:
-          events = fetch_usage_events(token, start, end)
+          events, events_truncated = fetch_usage_events(token, start, end)
           stats = aggregate_events(events)
         except CursorError:
           # Limits still matter if the events endpoint flakes; keep prior stats.
@@ -528,6 +544,8 @@ def main() -> int:
       )
       if not record["limits"] and summary.get("isUnlimited"):
         record["usageStatusText"] = "Unlimited plan"
+      elif events_truncated and not record["usageStatusText"]:
+        record["usageStatusText"] = "Usage history truncated"
   except CursorError as error:
     record = base_record(usageStatusText="Cursor unavailable", authHelpText=str(error))
   except Exception:

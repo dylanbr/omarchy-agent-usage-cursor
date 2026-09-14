@@ -12,7 +12,8 @@ its own publisher.
 
 This plugin is a headless `service` that:
 
-1. Runs `collectors/omarchy-agent-usage-cursor` every 5 minutes (and on shell start).
+1. Runs `collectors/omarchy-agent-usage-cursor` on a timer (limits often; full
+   event crawls less often — see Development).
 2. Validates the JSON record.
 3. Atomically writes `~/.local/state/omarchy/agents/usage/cursor.json`.
 
@@ -71,6 +72,13 @@ crawl on startup and every 30 minutes.
 Cursor's usage endpoints are undocumented dashboard APIs and may change.
 Auth uses the CLI access token via a `WorkosCursorSessionToken` cookie —
 the same approach community tools (e.g. Oh My Pi) use.
+
+**Team / enterprise accounts:** the collector currently maps
+`individualUsage` meters (personal Pro / Pro+ style). Accounts that only
+expose pooled `teamUsage` (or similar enterprise shapes) may show a plan
+tier with missing or empty limit meters until that mapping is added. Day and
+model token stats from usage events should still populate when the events
+API is available.
 
 ## License
 
