@@ -10,6 +10,10 @@ cycle, plus on-demand when that meter is capped. Plan tier comes from
 api2.cursor.sh/auth/full_stripe_profile. Day/model token stats are built from
 dashboard usage events when available.
 
+--limits-only refreshes plan/limits and reuses the last stored day/model stats.
+--force always performs a full refresh (limits + events), overriding
+--limits-only when both are passed.
+
 Auth is the access token written by `cursor-agent` / Cursor CLI login into
 ~/.config/cursor/auth.json (or CURSOR_ACCESS_TOKEN / CURSOR_API_KEY). The
 agents panel only ever reads the JSON this prints.
@@ -40,6 +44,15 @@ DASHBOARD_HOSTS = frozenset({"cursor.com", "www.cursor.com"})
 EVENTS_MAX_PAGES = 15
 EVENTS_PAGE_SIZE = 100
 EVENTS_LOOKBACK_DAYS = 30
+# Per-response cap: far above a normal page/summary, low enough to bound damage.
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+USAGE_RECORD_PATH = (
+  Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+  / "omarchy"
+  / "agents"
+  / "usage"
+  / "cursor.json"
+)
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -150,6 +163,20 @@ def session_cookie(token: str) -> str:
   )
 
 
+def read_capped(response) -> bytes:
+  chunks: list[bytes] = []
+  total = 0
+  while True:
+    chunk = response.read(65536)
+    if not chunk:
+      break
+    total += len(chunk)
+    if total > MAX_RESPONSE_BYTES:
+      raise CursorError("Cursor response exceeded size limit")
+    chunks.append(chunk)
+  return b"".join(chunks)
+
+
 def request_json(
   url: str,
   *,
@@ -162,10 +189,9 @@ def request_json(
   req = urllib.request.Request(url, data=data, headers=headers, method=method)
   try:
     with urllib.request.build_opener(NoRedirectHandler()).open(req, timeout=20) as response:
-      return json.load(response)
+      return json.loads(read_capped(response))
   except urllib.error.HTTPError as error:
-    # Drain the body so the socket can close cleanly, but never surface it in
-    # the panel — upstream payloads can include sensitive diagnostics.
+    # Drain a little so the socket can close; never surface the body in the panel.
     try:
       error.read(4096)
     except Exception:
@@ -175,8 +201,23 @@ def request_json(
     raise CursorError(f"Cursor API returned HTTP {error.code}") from error
   except urllib.error.URLError as error:
     raise CursorError("Could not reach the Cursor API") from error
-  except (json.JSONDecodeError, TimeoutError) as error:
+  except (json.JSONDecodeError, TimeoutError, UnicodeDecodeError) as error:
     raise CursorError("Cursor returned an invalid JSON response") from error
+
+
+def load_previous_stats() -> dict[str, Any]:
+  """Keep day/model stats across --limits-only refreshes."""
+  try:
+    previous = json.loads(USAGE_RECORD_PATH.read_text())
+  except (OSError, json.JSONDecodeError):
+    return empty_stats()
+  if not isinstance(previous, dict) or previous.get("id") != AGENT_ID:
+    return empty_stats()
+  stats = empty_stats()
+  for key in stats:
+    if key in previous:
+      stats[key] = previous[key]
+  return stats
 
 
 def fetch_stripe(token: str) -> dict[str, Any]:
@@ -438,9 +479,19 @@ def aggregate_events(events: list[dict[str, Any]]) -> dict[str, Any]:
 
 def main() -> int:
   parser = argparse.ArgumentParser(description="Print the Cursor usage record as JSON")
-  parser.add_argument("--force", action="store_true")
-  parser.add_argument("--limits-only", action="store_true")
+  parser.add_argument(
+    "--force",
+    action="store_true",
+    help="Fetch limits and usage events now (full refresh)",
+  )
+  parser.add_argument(
+    "--limits-only",
+    action="store_true",
+    help="Refresh plan/limits only; reuse previously stored day/model stats",
+  )
   args = parser.parse_args()
+  # --force always means a full update, even if --limits-only was also passed.
+  limits_only = args.limits_only and not args.force
 
   try:
     token = access_token()
@@ -454,16 +505,18 @@ def main() -> int:
       if not isinstance(summary, dict):
         raise CursorError("Cursor returned an empty usage summary")
 
-      stats = empty_stats()
-      if not args.limits_only:
+      if limits_only:
+        stats = load_previous_stats()
+      else:
+        stats = empty_stats()
         end = datetime.now(timezone.utc)
         start = end - timedelta(days=EVENTS_LOOKBACK_DAYS)
         try:
           events = fetch_usage_events(token, start, end)
           stats = aggregate_events(events)
         except CursorError:
-          # Limits still matter if the events endpoint flakes.
-          stats = empty_stats()
+          # Limits still matter if the events endpoint flakes; keep prior stats.
+          stats = load_previous_stats()
 
       record = base_record(
         ready=True,

@@ -13,16 +13,33 @@ Item {
   // Injected by omarchy-shell (the service loader).
   property var shell: null
 
-  readonly property int refreshIntervalMs: 300000
+  // Limits are cheap; event history is the expensive crawl.
+  readonly property int limitsIntervalMs: 300000
+  readonly property int eventsIntervalMs: 1800000
 
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string usageDir: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/omarchy/agents/usage"
   readonly property string pluginDir: Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "").replace(/\/$/, "")
   readonly property string recordPath: usageDir + "/cursor.json"
+  readonly property string collector: pluginDir + "/collectors/omarchy-agent-usage-cursor"
 
-  function refresh() {
-    if (!cursorCollector.running)
-      cursorCollector.running = true;
+  function refreshLimits() {
+    root.runCollector(["--limits-only"])
+  }
+
+  function refreshFull() {
+    // --force: immediate full update (limits + usage events).
+    root.runCollector(["--force"])
+  }
+
+  function runCollector(args) {
+    if (cursorCollector.running)
+      return
+    var command = ["python3", root.collector]
+    for (var i = 0; i < args.length; i++)
+      command.push(args[i])
+    cursorCollector.command = command
+    cursorCollector.running = true
   }
 
   Component.onCompleted: mkdirProcess.running = true
@@ -33,22 +50,31 @@ Item {
     onExited: function(exitCode) {
       if (exitCode !== 0)
         console.warn("agent-usage-cursor: could not create " + root.usageDir);
-      root.refresh();
+      // First paint should include day/model stats, not limits alone.
+      root.refreshFull();
     }
   }
 
   Timer {
-    interval: root.refreshIntervalMs
+    interval: root.limitsIntervalMs
     running: true
     repeat: true
     triggeredOnStart: false
-    onTriggered: root.refresh()
+    onTriggered: root.refreshLimits()
+  }
+
+  Timer {
+    interval: root.eventsIntervalMs
+    running: true
+    repeat: true
+    triggeredOnStart: false
+    onTriggered: root.refreshFull()
   }
 
   Process {
     id: cursorCollector
     property string agent: "cursor"
-    command: ["python3", root.pluginDir + "/collectors/omarchy-agent-usage-cursor"]
+    command: ["python3", root.collector, "--force"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.publish(cursorCollector.agent, text, cursorWriter)

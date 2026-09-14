@@ -59,9 +59,12 @@ rm -f ~/.local/state/omarchy/agents/usage/cursor.json
 
 ```sh
 omarchy plugin validate .
-python3 collectors/omarchy-agent-usage-cursor | jq .
+python3 collectors/omarchy-agent-usage-cursor --force | jq .
 python3 collectors/omarchy-agent-usage-cursor --limits-only | jq .
 ```
+
+The service refreshes limits every 5 minutes and does a full `--force` event
+crawl on startup and every 30 minutes.
 
 ## Notes
 
