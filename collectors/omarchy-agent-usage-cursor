@@ -32,8 +32,11 @@ from typing import Any
 AGENT_ID = "cursor"
 AGENT_NAME = "Cursor"
 AUTH_HELP = "Run `cursor-agent` and sign in, or set CURSOR_ACCESS_TOKEN."
-API2 = os.environ.get("CURSOR_API_ENDPOINT", "https://api2.cursor.sh").rstrip("/")
+DEFAULT_API2 = "https://api2.cursor.sh"
 DASHBOARD = "https://cursor.com"
+# Credential-bearing requests may only target these hosts (exact match).
+API_HOSTS = frozenset({"api2.cursor.sh"})
+DASHBOARD_HOSTS = frozenset({"cursor.com", "www.cursor.com"})
 EVENTS_MAX_PAGES = 15
 EVENTS_PAGE_SIZE = 100
 EVENTS_LOOKBACK_DAYS = 30
@@ -46,6 +49,28 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 class CursorError(Exception):
   pass
+
+
+def trusted_url(url: str, allowed_hosts: frozenset[str]) -> str:
+  """Require HTTPS to an allowlisted host before attaching credentials."""
+  try:
+    parts = urllib.parse.urlsplit(url)
+  except ValueError as error:
+    raise CursorError("Cursor endpoint URL is invalid") from error
+  if parts.scheme != "https":
+    raise CursorError("Cursor endpoint must use HTTPS")
+  host = (parts.hostname or "").lower()
+  if host not in allowed_hosts:
+    raise CursorError("Cursor endpoint host is not allowlisted")
+  return url
+
+
+def api2_base() -> str:
+  raw = os.environ.get("CURSOR_API_ENDPOINT", DEFAULT_API2).strip().rstrip("/")
+  if not raw:
+    raw = DEFAULT_API2
+  trusted_url(raw + "/", API_HOSTS)
+  return raw
 
 
 def empty_stats() -> dict[str, Any]:
@@ -128,19 +153,26 @@ def session_cookie(token: str) -> str:
 def request_json(
   url: str,
   *,
+  allowed_hosts: frozenset[str],
   headers: dict[str, str],
   data: bytes | None = None,
   method: str | None = None,
 ) -> Any:
+  trusted_url(url, allowed_hosts)
   req = urllib.request.Request(url, data=data, headers=headers, method=method)
   try:
     with urllib.request.build_opener(NoRedirectHandler()).open(req, timeout=20) as response:
       return json.load(response)
   except urllib.error.HTTPError as error:
-    body = error.read()[:200]
+    # Drain the body so the socket can close cleanly, but never surface it in
+    # the panel — upstream payloads can include sensitive diagnostics.
+    try:
+      error.read(4096)
+    except Exception:
+      pass
     if error.code in (401, 403):
       raise CursorError("Cursor rejected the access token") from error
-    raise CursorError(f"Cursor API returned HTTP {error.code}: {body!r}") from error
+    raise CursorError(f"Cursor API returned HTTP {error.code}") from error
   except urllib.error.URLError as error:
     raise CursorError("Could not reach the Cursor API") from error
   except (json.JSONDecodeError, TimeoutError) as error:
@@ -149,7 +181,8 @@ def request_json(
 
 def fetch_stripe(token: str) -> dict[str, Any]:
   return request_json(
-    API2 + "/auth/full_stripe_profile",
+    api2_base() + "/auth/full_stripe_profile",
+    allowed_hosts=API_HOSTS,
     headers={
       "Accept": "application/json",
       "Authorization": "Bearer " + token,
@@ -161,6 +194,7 @@ def fetch_stripe(token: str) -> dict[str, Any]:
 def fetch_usage_summary(token: str) -> dict[str, Any]:
   return request_json(
     DASHBOARD + "/api/usage-summary",
+    allowed_hosts=DASHBOARD_HOSTS,
     headers={
       "Accept": "application/json",
       "Cookie": session_cookie(token),
@@ -190,6 +224,7 @@ def fetch_usage_events(token: str, start: datetime, end: datetime) -> list[dict[
     ).encode()
     payload = request_json(
       DASHBOARD + "/api/dashboard/get-filtered-usage-events",
+      allowed_hosts=DASHBOARD_HOSTS,
       headers=headers,
       data=body,
       method="POST",

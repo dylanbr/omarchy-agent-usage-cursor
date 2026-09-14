@@ -18,6 +18,7 @@ Item {
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string usageDir: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/omarchy/agents/usage"
   readonly property string pluginDir: Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "").replace(/\/$/, "")
+  readonly property string recordPath: usageDir + "/cursor.json"
 
   function refresh() {
     if (!cursorCollector.running)
@@ -58,6 +59,27 @@ Item {
     }
   }
 
+  // FileView's setText is asynchronous relative to chmod; delay briefly so the
+  // atomic replace lands before we tighten mode to 0600 like stock collectors.
+  Timer {
+    id: chmodTimer
+    interval: 100
+    repeat: false
+    onTriggered: {
+      if (!chmodProcess.running)
+        chmodProcess.running = true;
+    }
+  }
+
+  Process {
+    id: chmodProcess
+    command: ["chmod", "600", root.recordPath]
+    onExited: function(exitCode) {
+      if (exitCode !== 0)
+        console.warn("agent-usage-cursor: could not chmod cursor.json");
+    }
+  }
+
   function publish(agent, output, writer) {
     var record = null;
     try {
@@ -67,6 +89,7 @@ Item {
     }
     if (record && typeof record === "object" && record.id === agent) {
       writer.setText(output.trim() + "\n");
+      chmodTimer.restart();
     } else {
       console.warn("agent-usage-cursor: invalid record from " + agent + " collector");
     }
@@ -74,7 +97,7 @@ Item {
 
   FileView {
     id: cursorWriter
-    path: root.usageDir + "/cursor.json"
+    path: root.recordPath
     watchChanges: false
     atomicWrites: true
     printErrors: true
