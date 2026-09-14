@@ -35,20 +35,18 @@ This plugin is a headless `service` that:
 
 ## Install
 
-From a published git remote:
-
 ```sh
-omarchy plugin add https://github.com/<you>/omarchy-agent-usage-cursor.git --enable
-```
-
-From this local checkout:
-
-```sh
-omarchy plugin add ~/Work/omarchy-agent-usage-cursor --enable --yes
+omarchy plugin add https://github.com/dylanbr/omarchy-agent-usage-cursor.git --enable
 ```
 
 Then restart the shell (or wait for the service timer) and open the Agents panel.
 Middle-click / `h`/`l` switches subscriptions when more than one is present.
+
+From a local checkout instead:
+
+```sh
+omarchy plugin add ~/Work/omarchy-agent-usage-cursor --enable --yes
+```
 
 ## Remove
 
